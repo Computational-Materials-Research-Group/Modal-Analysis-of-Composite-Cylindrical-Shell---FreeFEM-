@@ -18,7 +18,8 @@
   coordinates over one complete period.
 </p>
 
-<img width="1008" height="772" alt="COMP FATIGUE" src="https://github.com/user-attachments/assets/bcf287b0-f659-4088-8f9c-b82e663118b1" />
+<img width="1008" height="772" alt="COMPOSITE SHELL MODAL 1" src="https://github.com/user-attachments/assets/bc66707c-abbd-4c66-935b-45d9a69b7527" />
+
 
 ---
 
