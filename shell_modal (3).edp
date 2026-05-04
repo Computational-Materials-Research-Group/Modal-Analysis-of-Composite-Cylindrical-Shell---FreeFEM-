@@ -1,0 +1,509 @@
+// ============================================================
+// Modal Analysis of Composite Cylindrical Shell
+// FreeFEM++ : 2D Unrolled Shell + CLT + Eigenvalue Analysis
+//             DYNAMIC PVD Animation per mode
+//
+// METHOD - UNROLLED CYLINDER:
+//   A cylindrical shell (radius R, length L) is unrolled into
+//   a 2D rectangle [0,L] x [0, 2*pi*R].
+//   x-axis = axial direction
+//   y-axis = circumferential direction
+//
+//   Periodic BCs in y (bottom and top of rectangle = same
+//   physical line on cylinder).
+//
+//   Plane stress CLT elasticity (composite laminate).
+//   Consistent mass matrix assembled via varf.
+//   Eigenvalue problem: K*phi = omega^2 * M*phi
+//   Solved using FreeFEM++ EigenValue with FE-space vector array.
+//
+// MODE NOTATION (m;n):
+//   m = axial half-waves (number of half-wavelengths along L)
+//   n = circumferential waves (lobes around circumference)
+//   e.g. (1;2) = 1 axial half-wave, 2-lobe ovaling
+//        (1;4) = 1 axial half-wave, 4 petals
+//
+// DYNAMIC ANIMATION:
+//   Each mode gets its own PVD file: mode_01.pvd, mode_02.pvd ...
+//   Each PVD contains Ntime frames:
+//     u(x, t_j) = A * phi(x) * sin(2*pi*f*t_j)
+//   VTU writes DEFORMED surface coordinates:
+//     xp = x + amp * u_x * sin(...)
+//     yp = y + amp * u_y * sin(...)
+//   Coloured by displacement magnitude (velocity of oscillation)
+//   -> ParaView shows the shell PHYSICALLY VIBRATING
+//
+// LAMINATE: [0/90/0/90]_s CFRP (8 ply T300/5208)
+//
+// NOTE: No underscores in identifiers. All ASCII only.
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\shell_modal\\";
+system("mkdir \"D:\\freefem++\\shell_modal\"");
+
+// ============================================================
+// CYLINDER GEOMETRY
+// ============================================================
+real R      = 0.100;      // shell radius    [m]  100 mm
+real L      = 0.400;      // shell length    [m]  400 mm
+real hShell = 0.001;      // shell thickness [m]  1 mm (8 plies x 0.125mm)
+real Lx     = L;           // domain x = axial
+real Ly     = 2.*pi*R;    // domain y = circumferential arc length
+
+// ============================================================
+// LAMINATE [0/90/0/90]_s  CFRP T300/5208
+// 8 plies, each 0.125 mm
+// ============================================================
+real E1   = 181.e9;
+real E2   =  10.3e9;
+real G12  =   7.17e9;
+real nu12 =   0.28;
+real nu21 = nu12*E2/E1;
+real rhoP = 1600.;          // CFRP density [kg/m^3]
+
+// CLT A-matrix ([0/90/0/90]_s = 4 pairs)
+// For [0/90]_s balanced: A11=A22 (quasi-isotropic in-plane)
+real denom = 1. - nu12*nu21;
+real Q11 = E1/denom;
+real Q12 = nu12*E2/denom;
+real Q22 = E2/denom;
+real Q66 = G12;
+
+// [0] ply Qbar = Q (theta=0)
+// [90] ply: Q11<->Q22, Q66 unchanged
+real tPly = 0.000125;       // ply thickness
+int  Nply = 8;
+real hTot = Nply * tPly;    // = hShell
+
+// A-matrix: 4 plies at 0, 4 plies at 90
+real A11 = 4.*Q11*tPly + 4.*Q22*tPly;
+real A12 = 4.*Q12*tPly + 4.*Q12*tPly;
+real A22 = 4.*Q22*tPly + 4.*Q11*tPly;
+real A66 = 8.*Q66*tPly;
+
+// Effective plane-stress stiffness per unit area
+real Ceff11 = A11 / hTot;
+real Ceff12 = A12 / hTot;
+real Ceff22 = A22 / hTot;
+real Ceff66 = A66 / hTot;
+
+cout << "=============================================="  << endl;
+cout << " Composite Cylindrical Shell Modal Analysis"   << endl;
+cout << " R=" << R*1e3 << "mm  L=" << L*1e3 << "mm"    << endl;
+cout << " h=" << hShell*1e3 << "mm  rho=" << rhoP       << endl;
+cout << " Ceff11=" << Ceff11/1e9 << " GPa"               << endl;
+cout << " Ceff22=" << Ceff22/1e9 << " GPa"               << endl;
+cout << " Ceff12=" << Ceff12/1e9 << " GPa"               << endl;
+cout << " Ceff66=" << Ceff66/1e9 << " GPa"               << endl;
+cout << "=============================================="  << endl;
+
+// ============================================================
+// MESH (unrolled rectangle: x=axial, y=circumferential)
+// Fine enough to resolve high-n circumferential modes
+// Need >= 8 elements per circumferential half-wave for n=6
+// ny = 120 gives ~20 elements per wave at n=6
+// ============================================================
+int nx = 80;    // axial elements
+int ny = 120;   // circumferential elements
+
+border BotEdge(t=0, Lx) { x=t;    y=0.;   label=1; }  // y=0 (periodic)
+border RgtEdge(t=0, Ly) { x=Lx;   y=t;    label=2; }  // x=L (free end)
+border TopEdge(t=0, Lx) { x=Lx-t; y=Ly;   label=3; }  // y=Ly (periodic)
+border LftEdge(t=0, Ly) { x=0.;   y=Ly-t; label=4; }  // x=0 (fixed end)
+
+mesh Th = buildmesh(BotEdge(nx)+RgtEdge(ny)+TopEdge(nx)+LftEdge(ny));
+
+cout << " Mesh: nv=" << Th.nv << " nt=" << Th.nt << endl;
+
+// ============================================================
+// FE SPACES
+// P1 vector for displacement (ux=axial, uy=circumferential)
+// Using P1 to stay compatible with EigenValue FE-space API
+// ============================================================
+fespace Vh2(Th, [P1,P1]);
+fespace Ph(Th, P0);
+
+// ============================================================
+// STIFFNESS VARF  K
+// Plane-stress orthotropic (CLT effective properties)
+// BCs applied inside varf via on():
+//   Left (label 4): clamped  ux=uy=0 (fixed end)
+//   Right (label 2): free (simply supported: uy=0 only)
+//   Bottom/Top (labels 1,3): periodic -> NO Dirichlet here
+//                             (handled by mesh topology:
+//                              bottom and top nodes share
+//                              same DOF via periodic mesh)
+// Note: For simplicity without periodic mesh, we use
+//       symmetry: on(1,3) uy=0 which enforces zero circ
+//       displacement at y=0 and y=Ly (correct for even n)
+// ============================================================
+varf aStiff([ux,uy],[vx,vy]) =
+    int2d(Th)(
+        hShell * (
+            Ceff11 * dx(ux)*dx(vx)
+          + Ceff12 * dy(uy)*dx(vx)
+          + Ceff12 * dx(ux)*dy(vy)
+          + Ceff22 * dy(uy)*dy(vy)
+          + Ceff66 * (dy(ux)+dx(uy)) * (dy(vx)+dx(vy))
+        )
+    )
+    + on(4, ux=0., uy=0.)   // clamped left end
+    + on(1, uy=0.)           // symmetry bottom
+    + on(3, uy=0.)           // symmetry top  (periodic for even n)
+    ;
+
+// ============================================================
+// MASS VARF  M
+// Consistent mass: rho * h * int(u*v) dA
+// No Dirichlet on mass varf (standard practice)
+// ============================================================
+varf aMass([ux,uy],[vx,vy]) =
+    int2d(Th)(
+        rhoP * hShell * (ux*vx + uy*vy)
+    )
+    ;
+
+// Assemble global matrices
+matrix K = aStiff(Vh2, Vh2, solver=UMFPACK, factorize=1);
+matrix M = aMass (Vh2, Vh2);
+
+// ============================================================
+// EIGENVALUE ANALYSIS
+// Inverse power iteration with M-orthogonal deflation
+//
+// WHY NOT EigenValue API:
+//   Vh2 is a VECTOR space [P1,P1] with 2 components.
+//   FreeFEM++ requires Vh2[int] arrays of size 2*nev for vector
+//   spaces -> "array size must be 2 not 1" compile error.
+//   The EigenValue API only works with SCALAR FE spaces.
+//
+// ALGORITHM (shift-invert + deflation):
+//   For mode i:
+//     1. Deflate v against all previously found modes:
+//        v -= sum_j (phi_j' M v / phi_j' M phi_j) * phi_j
+//     2. Inverse iteration: w = (K - sigma*M)^-1 * M * v
+//     3. Rayleigh quotient: lambda = w'Kw / w'Mw
+//     4. Normalise: v = w / ||w||_M
+//     5. Repeat until converged
+//   sigma = shift (frequency^2 guess to target region)
+// ============================================================
+int nev = 12;
+real[int] ev(nev);
+ev = -1.;
+
+// Store eigenvectors as plain DOF arrays (2*Ndof per mode)
+int Ndof = Vh2.ndof;
+real[int,int] modeVecs(Ndof, nev);   // columns = eigenvectors
+
+// Shift: target lowest frequencies first (sigma near 0)
+// Use small positive shift to avoid rigid body modes
+real sigma = 1.0;   // rad^2/s^2 (very small -> targets f near 0)
+matrix Kshift = K - sigma * M;
+set(Kshift, solver=UMFPACK);
+
+for (int iMode=0; iMode<nev; iMode++) {
+
+    // ---- Initial vector: fill directly from node coordinates ----
+    // DOF ordering for [P1,P1]: interleaved -> DOF 2k=ux_k, 2k+1=uy_k
+    // Fill with sinusoidal pattern - different per mode to aid convergence
+    // No FE interpolation (avoids vector-space component assignment error)
+    real[int] vv(Ndof);
+    {
+        real scaleM = real(iMode+1);
+        for (int k=0; k<Th.nv; k++) {
+            real xk = Th(k).x;
+            real yk = Th(k).y;
+            vv[2*k]   = sin(scaleM*pi*xk/Lx) * cos(scaleM*pi*yk/Ly);
+            vv[2*k+1] = cos(scaleM*pi*xk/Lx) * sin(scaleM*pi*yk/Ly);
+        }
+    }
+
+    // ---- M-orthogonalise against already-found modes ----
+    for (int j=0; j<iMode; j++) {
+        real[int] phij(Ndof);
+        for (int k=0; k<Ndof; k++) phij[k] = modeVecs(k,j);
+        real[int] Mphij = M * phij;
+        real coeff = (vv'*Mphij) / max(phij'*Mphij, 1.e-30);
+        vv -= coeff * phij;
+    }
+
+    // M-normalise
+    {
+        real[int] Mv = M * vv;
+        real nrm = sqrt(vv'*Mv);
+        if (nrm > 1.e-30) vv = vv / nrm;
+    }
+
+    real lambdaOld = 0.;
+    real lambdaCurr = 0.;
+
+    // ---- Inverse power iteration ----
+    for (int iter=0; iter<300; iter++) {
+
+        // w = (K - sigma*M)^-1 * M * v
+        real[int] Mv  = M * vv;
+        real[int] ww  = Kshift^-1 * Mv;
+
+        // M-orthogonalise against previous modes
+        for (int j=0; j<iMode; j++) {
+            real[int] phij(Ndof);
+            for (int k=0; k<Ndof; k++) phij[k] = modeVecs(k,j);
+            real[int] Mphij = M * phij;
+            real coeff = (ww'*Mphij) / max(phij'*Mphij, 1.e-30);
+            ww -= coeff * phij;
+        }
+
+        // Rayleigh quotient: lambda = w'Kw / w'Mw
+        real[int] Kw  = K * ww;
+        real[int] Mww = M * ww;
+        real num  = ww'*Kw;
+        real den  = ww'*Mww;
+        if (abs(den) < 1.e-30) break;
+        lambdaCurr = num / den;
+
+        // M-normalise
+        real nrm = sqrt(ww'*Mww);
+        if (nrm > 1.e-30) vv = ww / nrm;
+        else break;
+
+        // Convergence check
+        if (iter >= 5 && abs(lambdaCurr-lambdaOld) < 1.e-8*abs(lambdaCurr)) {
+            cout << "  Mode " << iMode+1 << " converged at iter=" << iter+1
+                 << "  lambda=" << lambdaCurr << endl;
+            break;
+        }
+        lambdaOld = lambdaCurr;
+    }
+
+    ev[iMode] = lambdaCurr;
+    // Store eigenvector
+    for (int k=0; k<Ndof; k++) modeVecs(k, iMode) = vv[k];
+}
+
+// Print frequencies
+cout << "=============================================="  << endl;
+cout << " NATURAL FREQUENCIES"                           << endl;
+cout << " Mode  f[Hz]   omega[rad/s]"                    << endl;
+for (int i=0; i<nev; i++) {
+    if (ev[i] > 0.) {
+        real omega = sqrt(ev[i]);
+        real freq  = omega/(2.*pi);
+        cout << "  " << i+1
+             << "    " << freq
+             << "    " << omega << endl;
+    }
+}
+cout << "=============================================="  << endl;
+
+// ============================================================
+// DYNAMIC ANIMATION PER MODE
+//
+// For mode i with frequency f_i and shape phi_i:
+//   u(x,t) = A * phi_i(x) * sin(2*pi*f_i*t)
+//
+// Write Ntime VTU frames covering one full period T = 1/f_i
+// Each frame: deformed coordinates = original + amp*u(t)
+// Colour by |u(t)| = displacement magnitude at each node
+//
+// One PVD per mode: mode_01.pvd, mode_02.pvd, ...
+// Open each in ParaView -> Play -> see REAL vibration motion
+// ============================================================
+int  Ntime  = 40;    // frames per mode (one full oscillation)
+real ampMax = R * 0.08;  // max deformation amplitude = 8% of radius
+
+fespace ShPost(Th, P1);
+ShPost uMag;
+ShPost phiX, phiY;   // mode shape components
+
+for (int iMode=0; iMode<nev; iMode++) {
+    if (ev[iMode] <= 0.) continue;
+
+    real omega = sqrt(ev[iMode]);
+    real freq  = omega / (2.*pi);
+    real T     = 1. / freq;              // period [s]
+
+    // Extract mode shape from modeVecs DOF array
+    // modeVecs(:, iMode) is the full Vh2 DOF vector
+    // Load into Vh2 FE function then split into components
+    {
+        Vh2 [wModeX, wModeY];
+        real[int] vvMode(Ndof);
+        for (int k=0; k<Ndof; k++) vvMode[k] = modeVecs(k, iMode);
+        wModeX[] = vvMode;   // load full Vh2 DOF vector
+        phiX = wModeX;       // extract x-component (P1 projection)
+        phiY = wModeY;       // extract y-component
+    }
+
+    real phiMax = 0.;
+    for (int k=0; k<Th.nv; k++) {
+        real px = phiX[][k];
+        real py = phiY[][k];
+        phiMax = max(phiMax, sqrt(px*px + py*py));
+    }
+    if (phiMax < 1.e-30) continue;
+
+    phiX = phiX / phiMax;
+    phiY = phiY / phiMax;
+
+    cout << " Animating mode " << iMode+1
+         << "  f=" << freq << " Hz"
+         << "  amp=" << ampMax*1e3 << " mm" << endl;
+
+    // Mode number string for filenames (zero-padded)
+    string mnum;
+    if (iMode+1 < 10) mnum = "0"+(iMode+1);
+    else               mnum = ""+(iMode+1);
+
+    // PVD header for this mode
+    {
+        ofstream pvd(outdir+"mode"+mnum+".pvd");
+        pvd << "<?xml version='1.0'?>"                    << endl;
+        pvd << "<VTKFile type='Collection' version='0.1'>" << endl;
+        pvd << "<Collection>"                              << endl;
+    }
+
+    // Time loop: one complete oscillation
+    for (int it=0; it<Ntime; it++) {
+        real tNow = T * real(it) / real(Ntime);
+        real sinT = sin(2.*pi*freq*tNow);
+
+        // Deformed coordinates
+        // Displacement magnitude field (speed indicator)
+        uMag = ampMax * sqrt(phiX*phiX + phiY*phiY) * abs(sinT);
+
+        // VTU filename
+        string tnum;
+        if      (it <  10) tnum = "00"+it;
+        else if (it < 100) tnum = "0" +it;
+        else                tnum = ""  +it;
+
+        string vtuName = outdir+"mode"+mnum+"_t"+tnum+".vtu";
+        {
+            ofstream vtu(vtuName);
+            vtu << "<?xml version='1.0'?>" << endl;
+            vtu << "<VTKFile type='UnstructuredGrid' version='0.1'>" << endl;
+            vtu << "<UnstructuredGrid>" << endl;
+            vtu << "<Piece NumberOfPoints='" << Th.nv
+                << "' NumberOfCells='" << Th.nt << "'>" << endl;
+
+            // 3D CYLINDRICAL COORDINATES
+            // The unrolled rectangle maps back to cylinder as:
+            //   xFlat = axial position along cylinder  -> 3D X = xFlat
+            //   yFlat = arc length = R * theta         -> theta = yFlat/R
+            //   Radial outward direction: (0, sin(theta), cos(theta))
+            //   Circ tangent direction:  (0, cos(theta), -sin(theta))
+            //
+            // Undeformed cylinder surface point:
+            //   X3 = xFlat
+            //   Y3 = R * sin(theta)
+            //   Z3 = R * cos(theta)
+            //
+            // Mode shape displacement:
+            //   phiX = axial displacement component
+            //   phiY = circumferential displacement component
+            //   Radial displacement (breathing mode) = phiY projected radially
+            //   For circumferential modes: radial = phiY * sin(n*theta)
+            //   Safe approximation: apply phiY in radial outward direction
+            //
+            // Deformed point at time t:
+            //   dX  = phiX[][k] * sinT                     (axial)
+            //   dR  = phiY[][k] * sinT                     (radial outward)
+            //   X3d = X3 + dX
+            //   Y3d = (R + dR) * sin(theta)
+            //   Z3d = (R + dR) * cos(theta)
+
+            vtu << "<Points><DataArray type='Float64' NumberOfComponents='3' format='ascii'>" << endl;
+            for (int k=0; k<Th.nv; k++) {
+                real xFlat = Th(k).x;
+                real yFlat = Th(k).y;
+                real theta = yFlat / R;
+                real dAx   = ampMax * phiX[][k] * sinT;  // axial disp
+                real dRad  = ampMax * phiY[][k] * sinT;  // radial disp
+                real X3d   = xFlat + dAx;
+                real Y3d   = (R + dRad) * sin(theta);
+                real Z3d   = (R + dRad) * cos(theta);
+                vtu << X3d << " " << Y3d << " " << Z3d << endl;
+            }
+            vtu << "</DataArray></Points>" << endl;
+
+            // Triangle connectivity (same as 2D mesh)
+            vtu << "<Cells>" << endl;
+            vtu << "<DataArray type='Int32' Name='connectivity' format='ascii'>" << endl;
+            for (int i=0; i<Th.nt; i++)
+                vtu << Th[i][0] << " " << Th[i][1] << " " << Th[i][2] << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Int32' Name='offsets' format='ascii'>" << endl;
+            for (int i=0; i<Th.nt; i++) vtu << 3*(i+1) << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Int32' Name='types' format='ascii'>" << endl;
+            for (int i=0; i<Th.nt; i++) vtu << 5 << endl;
+            vtu << "</DataArray></Cells>" << endl;
+
+            // Point data
+            vtu << "<PointData>" << endl;
+            vtu << "<DataArray type='Float64' Name='DispMag' format='ascii'>" << endl;
+            for (int k=0; k<Th.nv; k++) vtu << uMag[][k] << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Float64' Name='AxialDisp' format='ascii'>" << endl;
+            for (int k=0; k<Th.nv; k++) vtu << ampMax*phiX[][k]*sinT << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Float64' Name='RadialDisp' format='ascii'>" << endl;
+            for (int k=0; k<Th.nv; k++) vtu << ampMax*phiY[][k]*sinT << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "</PointData>" << endl;
+            vtu << "</Piece></UnstructuredGrid></VTKFile>" << endl;
+        }
+
+        // Append to PVD
+        {
+            ofstream pvd(outdir+"mode"+mnum+".pvd", append);
+            pvd << "  <DataSet timestep='" << it
+                << "' file='mode" << mnum << "_t" << tnum << ".vtu'/>" << endl;
+        }
+    }
+
+    // Close PVD for this mode
+    {
+        ofstream pvd(outdir+"mode"+mnum+".pvd", append);
+        pvd << "</Collection>" << endl;
+        pvd << "</VTKFile>"    << endl;
+    }
+
+    cout << "  Saved mode " << iMode+1 << " -> "
+         << outdir << "mode" << mnum << ".pvd" << endl;
+}
+
+// ============================================================
+// SUMMARY FILE
+// ============================================================
+{
+    ofstream summ(outdir+"frequencies.txt");
+    summ << "Mode  Frequency_Hz  Omega_rad_s" << endl;
+    for (int i=0; i<nev; i++) {
+        if (ev[i] > 0.) {
+            real omega = sqrt(ev[i]);
+            real freq  = omega/(2.*pi);
+            summ << i+1 << "  " << freq << "  " << omega << endl;
+        }
+    }
+}
+
+cout << "=============================================="  << endl;
+cout << " DONE."                                         << endl;
+cout << " Each mode has its own PVD file:"               << endl;
+cout << " mode01.pvd = Mode 1 (lowest frequency)"        << endl;
+cout << " mode02.pvd = Mode 2 ..."                       << endl;
+cout << " frequencies.txt = all natural frequencies"     << endl;
+cout << ""                                               << endl;
+cout << " PARAVIEW:"                                     << endl;
+cout << " 1. File > Open > mode01.pvd > Apply"           << endl;
+cout << " 2. Colour by DispMag"                          << endl;
+cout << "    -> red = max vibration amplitude"            << endl;
+cout << " 3. Press Play"                                  << endl;
+cout << "    -> shell PHYSICALLY OSCILLATES each frame"  << endl;
+cout << "    -> NOT static: geometry moves in real time"  << endl;
+cout << " 4. Open mode02.pvd for second mode etc."        << endl;
+cout << " 5. Filters > Tube or Warp to exaggerate motion" << endl;
+cout << "=============================================="  << endl;
